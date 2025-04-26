@@ -7,6 +7,9 @@ Analysis - Decoding pcap files and packets
 import time
 import socket
 import struct
+from copy import copy
+from dataclasses import dataclass
+from typing import Optional, Union, Any
 
 from .settings import settings
 from .debugging import ModuleLogger, bacpypes_debugging, btox
@@ -45,6 +48,17 @@ _protocols = {
     socket.IPPROTO_UDP: "udp",
     socket.IPPROTO_ICMP: "icmp",
 }
+
+
+@dataclass
+class DecodedPacket:
+    """Dataclass representing a fully decoded BACnet packet with all layers"""
+    pdu: PDU
+    lpdu: Optional[LPDU] = None
+    npdu: Optional[NPDU] = None
+    apdu: Optional[APDU] = None
+    number: Optional[int] = None
+    timestamp: Optional[float] = None
 
 
 def strftimestamp(ts):
@@ -126,6 +140,160 @@ def decode_udp(s):
 
 
 @bacpypes_debugging
+def decode_lpdu(pdu: PDU) -> tuple[Union[PDU, LPDU], Any]:
+    """Decode the LPDU layer from a PDU"""
+    if _debug:
+        decode_lpdu._debug("decode_lpdu %r", pdu)
+    
+    # check for a BVLL header
+    if pdu.pduData[0] != 0x81:
+        return pdu, None
+    
+    if _debug:
+        decode_lpdu._debug("    - BVLL header found")
+
+    try:
+        lpdu = LPDU.decode(pdu)
+    except Exception as err:
+        if _debug:
+            decode_lpdu._debug("    - BVLL PDU decoding error: %r", err)
+        return pdu, None
+
+    # make a more focused interpretation
+    atype = bvll_pdu_types.get(lpdu.bvlciFunction)
+    if not atype:
+        if _debug:
+            decode_lpdu._debug("    - unknown BVLL type: %r", lpdu.bvlciFunction)
+        return lpdu, None
+
+    # decode it as one of the basic types
+    try:
+        xpdu = lpdu
+        bpdu = atype()
+        lpdu = atype.decode(lpdu)
+        if _debug:
+            decode_lpdu._debug("    - bpdu: %r", bpdu)
+
+        # lift the address for forwarded NPDU's
+        if atype is ForwardedNPDU:
+            old_pdu_source = lpdu.pduSource
+            if settings.route_aware and bpdu.bvlciAddress:
+                lpdu.pduSource = bpdu.bvlciAddress
+                lpdu.pduSource.addrRoute = old_pdu_source
+        # no deeper decoding for some
+        elif atype not in (
+            DistributeBroadcastToNetwork,
+            OriginalUnicastNPDU,
+            OriginalBroadcastNPDU,
+        ):
+            return lpdu, bpdu
+
+    except Exception as err:
+        if _debug:
+            decode_lpdu._debug("    - decoding Error: %r", err)
+        return xpdu, None
+    
+    return lpdu, bpdu
+
+
+@bacpypes_debugging
+def decode_npdu(pdu: PDU) -> Optional[NPDU]:
+    """Decode the NPDU layer from a PDU"""
+    if _debug:
+        decode_npdu._debug("decode_npdu %r", pdu)
+    
+    # check for version number
+    if pdu.pduData[0] != 0x01:
+        if _debug:
+            decode_npdu._debug(
+                "    - not a version 1 packet: %s...", btox(pdu.pduData[:30], ".")
+            )
+        return None
+
+    # it's an NPDU
+    try:
+        npdu = NPDU.decode(pdu)
+    except Exception as err:
+        if _debug:
+            decode_npdu._debug("    - NPDU decoding Error: %r", err)
+        return None
+    
+    if _debug:
+        decode_npdu._debug("    - npdu: %r", npdu)
+    
+    # If it's a network layer message, handle the special decoding
+    if npdu.npduNetMessage is not None:
+        # make a more focused interpretation
+        ntype = npdu_types.get(npdu.npduNetMessage)
+        if not ntype:
+            if _debug:
+                decode_npdu._debug(
+                    "    - no network layer decoder: %r", npdu.npduNetMessage
+                )
+            return npdu
+        if _debug:
+            decode_npdu._debug("    - ntype: %r", ntype)
+
+        # deeper decoding
+        try:
+            npdu = ntype.decode(npdu)
+        except Exception as err:
+            if _debug:
+                decode_npdu._debug("    - decoding error: %r", err)
+    
+    return npdu
+
+
+@bacpypes_debugging
+def decode_apdu(npdu: NPDU) -> Optional[APDU]:
+    """Decode the APDU layer from an NPDU"""
+    if _debug:
+        decode_apdu._debug("decode_apdu %r", npdu)
+    
+    # Check if this is a network layer message
+    if npdu.npduNetMessage is not None:
+        if _debug:
+            decode_apdu._debug("    - this is a network layer message, not an APDU")
+        return None
+    
+    if _debug:
+        decode_apdu._debug("    - not a network layer message, try as an APDU")
+
+    # decode as a generic APDU
+    try:
+        apdu = APDU.decode(npdu)
+    except Exception as err:
+        if _debug:
+            decode_apdu._debug("    - decoding Error: %r", err)
+        return None
+
+    # "lift" the source and destination address
+    if npdu.npduSADR:
+        apdu.pduSource = npdu.npduSADR
+        if settings.route_aware:
+            apdu.pduSource.addrRoute = npdu.pduSource
+    else:
+        apdu.pduSource = npdu.pduSource
+    if npdu.npduDADR:
+        apdu.pduDestination = npdu.npduDADR
+    else:
+        apdu.pduDestination = npdu.pduDestination
+
+    if isinstance(
+        apdu, (ConfirmedRequestPDU, ComplexAckPDU, UnconfirmedRequestPDU)
+    ):
+        try:
+            apdu = APCISequence.decode(apdu)
+            if _debug:
+                decode_apdu._debug("    - apdu: %r", apdu)
+        except AttributeError as err:
+            if _debug:
+                decode_apdu._debug("    - decoding error: %r", err)
+
+    return apdu
+
+
+@bacpypes_debugging
 def decode_packet(data):
     """decode the data, return some kind of PDU."""
     if _debug:
@@ -137,8 +305,8 @@ def decode_packet(data):
 
     # assume it is ethernet for now
     d = decode_ethernet(data)
-    pduSource = Address(d["source_address"])
-    pduDestination = Address(d["destination_address"])
+    pdu_source = Address(d["source_address"])
+    pdu_destination = Address(d["destination_address"])
     data = d["data"]
 
     # there could be a VLAN header
@@ -186,130 +354,105 @@ def decode_packet(data):
     # build a PDU
     pdu = PDU(data, source=pduSource, destination=pduDestination)
 
-    # check for a BVLL header
-    if pdu.pduData[0] == 0x81:
-        if _debug:
-            decode_packet._debug("    - BVLL header found")
-
-        try:
-            pdu = LPDU.decode(pdu)
-        except Exception as err:
-            if _debug:
-                decode_packet._debug("    - BVLL PDU decoding error: %r", err)
-            return pdu
-
-        # make a more focused interpretation
-        atype = bvll_pdu_types.get(pdu.bvlciFunction)
-        if not atype:
-            if _debug:
-                decode_packet._debug("    - unknown BVLL type: %r", pdu.bvlciFunction)
-            return pdu
-
-        # decode it as one of the basic types
-        try:
-            xpdu = pdu
-            bpdu = atype()
-            pdu = atype.decode(pdu)
-            if _debug:
-                decode_packet._debug("    - bpdu: %r", bpdu)
-
-            # lift the address for forwarded NPDU's
-            if atype is ForwardedNPDU:
-                old_pdu_source = pdu.pduSource
-                pdu.pduSource = bpdu.bvlciAddress
-                if settings.route_aware:
-                    pdu.pduSource.addrRoute = old_pdu_source
-            # no deeper decoding for some
-            elif atype not in (
-                DistributeBroadcastToNetwork,
-                OriginalUnicastNPDU,
-                OriginalBroadcastNPDU,
-            ):
-                return pdu
-
-        except Exception as err:
-            if _debug:
-                decode_packet._debug("    - decoding Error: %r", err)
-            return xpdu
-
-    # check for version number
-    if pdu.pduData[0] != 0x01:
-        if _debug:
-            decode_packet._debug(
-                "    - not a version 1 packet: %s...", btox(pdu.pduData[:30], ".")
-            )
-        return None
-
-    # it's an NPDU
-    try:
-        npdu = NPDU.decode(pdu)
-    except Exception as err:
-        if _debug:
-            decode_packet._debug("    - NPDU decoding Error: %r", err)
-        return None
-    if _debug:
-        decode_packet._debug("    - npdu: %r", npdu)
-
-    # application or network layer message
-    if npdu.npduNetMessage is None:
-        if _debug:
-            decode_packet._debug("    - not a network layer message, try as an APDU")
-
-        # decode as a generic APDU
-        try:
-            apdu = APDU.decode(npdu)
-        except Exception as err:
-            if _debug:
-                decode_packet._debug("    - decoding Error: %r", err)
-            return npdu
-
-        # "lift" the source and destination address
-        if npdu.npduSADR:
-            apdu.pduSource = npdu.npduSADR
-            if settings.route_aware:
-                apdu.pduSource.addrRoute = npdu.pduSource
-        else:
-            apdu.pduSource = npdu.pduSource
-        if npdu.npduDADR:
-            apdu.pduDestination = npdu.npduDADR
-        else:
-            apdu.pduDestination = npdu.pduDestination
-
-        if isinstance(
-            apdu, (ConfirmedRequestPDU, ComplexAckPDU, UnconfirmedRequestPDU)
-        ):
-            try:
-                apdu = APCISequence.decode(apdu)
-                if _debug:
-                    decode_packet._debug("    - apdu: %r", apdu)
-            except AttributeError as err:
-                if _debug:
-                    decode_packet._debug("    - decoding error: %r", err)
-
-        # success
+    # Process LPDU layer
+    lpdu, bpdu = decode_lpdu(pdu)
+    
+    # Process NPDU layer
+    npdu = decode_npdu(lpdu)
+    if not npdu:
+        return lpdu
+    
+    # Process APDU layer
+    apdu = decode_apdu(npdu)
+    
+    # Return the appropriate result
+    if apdu:
         return apdu
-
     else:
-        # make a more focused interpretation
-        ntype = npdu_types.get(npdu.npduNetMessage)
-        if not ntype:
-            if _debug:
-                decode_packet._debug(
-                    "    - no network layer decoder: %r", npdu.npduNetMessage
-                )
-            return npdu
-        if _debug:
-            decode_packet._debug("    - ntype: %r", ntype)
-
-        # deeper decoding
-        try:
-            npdu = ntype.decode(npdu)
-        except Exception as err:
-            if _debug:
-                decode_packet._debug("    - decoding error: %r", err)
-
-        # success
         return npdu
+
+
+@bacpypes_debugging
+def decode_packet_full(data) -> Optional[DecodedPacket]:
+    """
+    Decode the data, returning a DecodedPacket containing all layers.
+    """
+    if _debug:
+        decode_packet_full._debug("decode_packet_full %r", data)
+
+    # empty strings are some other kind of pcap content
+    if not data:
+        return None
+
+    # assume it is ethernet for now
+    d = decode_ethernet(data)
+    pduSource = Address(d["source_address"])
+    pduDestination = Address(d["destination_address"])
+    data = d["data"]
+
+    # there could be a VLAN header
+    if d["type"] == 0x8100:
+        if _debug:
+            decode_packet_full._debug("    - vlan found")
+
+        d = decode_vlan(data)
+        data = d["data"]
+
+    # look for IP packets
+    if d["type"] == 0x0800:
+        if _debug:
+            decode_packet_full._debug("    - IP found")
+
+        d = decode_ip(data)
+        pduSource, pduDestination = d["source_address"], d["destination_address"]
+        data = d["data"]
+
+        if d["protocol"] == "udp":
+            if _debug:
+                decode_packet_full._debug("    - UDP found")
+
+            d = decode_udp(data)
+            data = d["data"]
+
+            pduSource = Address((pduSource, d["source_port"]))
+            pduDestination = Address((pduDestination, d["destination_port"]))
+            if _debug:
+                decode_packet_full._debug("    - pduSource: %r", pduSource)
+                decode_packet_full._debug("    - pduDestination: %r", pduDestination)
+        else:
+            if _debug:
+                decode_packet_full._debug("    - not a UDP packet")
+    else:
+        if _debug:
+            decode_packet_full._debug("    - not an IP packet")
+
+    # check for empty
+    if not data:
+        if _debug:
+            decode_packet_full._debug("    - empty packet")
+        return None
+
+    # build a PDU
+    pdu = PDU(data, source=pduSource, destination=pduDestination)
+    
+    result = DecodedPacket(pdu=pdu)
+
+    # Process LPDU layer
+    lpdu, bpdu = decode_lpdu(pdu)
+    if lpdu and lpdu != pdu:
+        result.lpdu = lpdu
+    
+    # Process NPDU layer
+    npdu = decode_npdu(lpdu)
+    if npdu:
+        result.npdu = npdu
+    
+        # Process APDU layer only if we have an NPDU
+        apdu = decode_apdu(npdu)
+        if apdu:
+            result.apdu = apdu
+    
+    return result
 
 
 @bacpypes_debugging
@@ -337,6 +480,35 @@ def decode_file(fname):
         # save the packet number (as viewed in Wireshark) and timestamp
         pkt._number = i + 1
         pkt._timestamp = timestamp
+
+        yield pkt
+
+
+@bacpypes_debugging
+def decode_file_full(fname):
+    """Given the name of a pcap file, open it, decode the contents and yield each full decoded packet."""
+    if _debug:
+        decode_file_full._debug("decode_file_full %r", fname)
+
+    if not pylibpcap:
+        raise RuntimeError("failed to import pylibpcap")
+
+    p = pylibpcap.pcap.rpcap(fname)
+
+    # loop through the packets
+    for i, (len, timestamp, data) in enumerate(p):
+        try:
+            pkt = decode_packet_full(data)
+            if not pkt:
+                continue
+        except Exception as err:
+            if _debug:
+                decode_file_full._debug("    - exception decoding packet %d: %r", i + 1, err)
+            continue
+
+        # save the packet number (as viewed in Wireshark) and timestamp
+        pkt.number = i + 1
+        pkt.timestamp = timestamp
 
         yield pkt
 
@@ -392,16 +564,38 @@ if __name__ == "__main__":
             nargs="+",
             help="the names of the pcaps file to decode",
         )
+        parser.add_argument(
+            "--full",
+            action="store_true",
+            help="use full packet decoding with all layers",
+        )
         args = parser.parse_args()
         _log.debug("args: %r", args)
         _log.debug("settings: %r", settings)
 
         for fname in args.filename:
             _log.debug("decode_file %r", fname)
-            for pkt in decode_file(fname):
-                print(strftimestamp(pkt._timestamp), pkt.__class__.__name__)
-                pkt.debug_contents()
-                print("")
+            if args.full:
+                for pkt in decode_file_full(fname):
+                    print(strftimestamp(pkt.timestamp), end=" ")
+                    if pkt.apdu:
+                        print("APDU:", pkt.apdu.__class__.__name__)
+                        pkt.apdu.debug_contents()
+                    elif pkt.npdu:
+                        print("NPDU:", pkt.npdu.__class__.__name__)
+                        pkt.npdu.debug_contents()
+                    elif pkt.lpdu:
+                        print("LPDU:", pkt.lpdu.__class__.__name__)
+                        pkt.lpdu.debug_contents()
+                    else:
+                        print("PDU")
+                        pkt.pdu.debug_contents()
+                    print("")
+            else:
+                for pkt in decode_file(fname):
+                    print(strftimestamp(pkt._timestamp), pkt.__class__.__name__)
+                    pkt.debug_contents()
+                    print("")
 
     except KeyboardInterrupt:
         pass
