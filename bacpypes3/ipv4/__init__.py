@@ -134,20 +134,16 @@ class IPv4DatagramServer(Server[PDU]):
                     "    - broadcast_address: %r", self.broadcast_address
                 )
 
-            # Windows takes care of the broadcast, but Linux needs a broadcast endpoint
+            # Windows takes care of the broadcast, but Linux needs a broadcast endpoint.
+            # Never reuse bind_socket here: it is already bound to the unicast address
+            # and a socket can only be passed to create_datagram_endpoint once.
+            # The broadcast listener must be a separate socket bound to addrBroadcastTuple.
             if "nt" not in os.name:
-                if bind_socket:
-                    broadcast_endpoint_task = loop.create_task(
-                        self.retrying_create_datagram_endpoint(
-                            loop, address.addrBroadcastTuple, bind_socket=bind_socket 
-                        )
+                broadcast_endpoint_task = loop.create_task(
+                    self.retrying_create_datagram_endpoint(
+                        loop, address.addrBroadcastTuple
                     )
-                else:
-                    broadcast_endpoint_task = loop.create_task(
-                        self.retrying_create_datagram_endpoint(
-                            loop, address.addrBroadcastTuple
-                        )
-                    )
+                )
                 if _debug:
                     IPv4DatagramServer._debug(
                         "    - broadcast_endpoint_task: %r", broadcast_endpoint_task
@@ -170,9 +166,8 @@ class IPv4DatagramServer(Server[PDU]):
                     return await loop.create_datagram_endpoint(
                         IPv4DatagramProtocol, sock=bind_socket
                     )
-                reuse_port = "nt" not in os.name
                 return await loop.create_datagram_endpoint(
-                    IPv4DatagramProtocol, local_addr=addrTuple, allow_broadcast=True, reuse_port=reuse_port
+                    IPv4DatagramProtocol, local_addr=addrTuple, allow_broadcast=True, reuse_port=True
                 )
             except OSError:
                 if _debug:
